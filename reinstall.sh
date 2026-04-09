@@ -6,9 +6,9 @@
 # alpine 默认没有 bash，因此 shebang 用 sh，再 exec 切换到 bash
 
 set -eE
-confhome=https://raw.githubusercontent.com/bin456789/reinstall/main
-confhome_cn=https://cnb.cool/bin456789/reinstall/-/git/raw/main
-# confhome_cn=https://www.ghproxy.cc/https://raw.githubusercontent.com/bin456789/reinstall/main
+confhome=https://raw.githubusercontent.com/sxlmnwb/reinstall/main
+confhome_cn=https://cnb.cool/sxlmnwb/reinstall/-/git/raw/main
+# confhome_cn=https://www.ghproxy.cc/https://raw.githubusercontent.com/sxlmnwb/reinstall/main
 
 # 用于判断 reinstall.sh 和 trans.sh 是否兼容
 SCRIPT_VERSION=4BACD833-A585-23BA-6CBB-9AA4E08E0004
@@ -88,6 +88,8 @@ Usage: $reinstall_____ anolis      7|8|23
                        opensuse    15.6|16.0|tumbleweed
                        openeuler   20.03|22.03|24.03|25.09
                        ubuntu      16.04|18.04|20.04|22.04|24.04|25.10 [--minimal]
+                       freebsd     13.5|14.3|14.4|15.0 [--variant=ufs|zfs]
+                       openbsd     7.4|7.5|7.6|7.7
                        kali
                        arch
                        gentoo
@@ -111,7 +113,7 @@ Usage: $reinstall_____ anolis      7|8|23
                        [--rdp-port    PORT]
                        [--add-driver  INF_OR_DIR]
 
-Manual: https://github.com/bin456789/reinstall
+Manual: https://github.com/sxlmnwb/reinstall
 
 EOF
     exit 1
@@ -1860,6 +1862,65 @@ Continue with DD?
         fi
     }
 
+    setos_freebsd() {
+        if is_in_china; then
+            mirror=https://mirror.nju.edu.cn/freebsd
+        else
+            mirror=https://download.freebsd.org
+        fi
+
+        case "$basearch" in
+        x86_64) arch_freebsd=amd64 ;;
+        aarch64) arch_freebsd=arm64 ;;
+        esac
+
+        # 默认使用 ufs 变体
+        bsd_variant=${bsd_variant:-ufs}
+
+        # 优先使用云镜像 (qcow2)，不可用时回退到 memstick
+        # 云镜像已预装系统，支持 cloud-init
+        # memstick 是安装器，需要 bsdinstall 自动化
+        # FreeBSD 15.0+ 云镜像使用新命名格式 (-ufs.qcow2.xz / -zfs.qcow2.xz)
+        # 旧格式: FreeBSD-X.Y-RELEASE-amd64.qcow2.xz
+        # 新格式: FreeBSD-X.Y-RELEASE-amd64-ufs.qcow2.xz
+        ci_img=$mirror/releases/VM-IMAGES/$releasever-RELEASE/$arch_freebsd/Latest/FreeBSD-$releasever-RELEASE-$arch_freebsd-$bsd_variant.qcow2.xz
+        if ! test_url_grace $ci_img 'qemu.xz'; then
+            ci_img=$mirror/releases/VM-IMAGES/$releasever-RELEASE/$arch_freebsd/Latest/FreeBSD-$releasever-RELEASE-$arch_freebsd.qcow2.xz
+            if test_url_grace $ci_img 'qemu.xz'; then
+                img=$ci_img
+                cloud_image=1
+            else
+                img=$mirror/releases/ISO-IMAGES/$releasever/FreeBSD-$releasever-RELEASE-$arch_freebsd-memstick.img.xz
+                test_url $img 'raw.xz'
+            fi
+        else
+            img=$ci_img
+            cloud_image=1
+        fi
+        eval ${step}_img=$img
+        eval ${step}_arch_freebsd=$arch_freebsd
+        eval ${step}_bsd_variant=$bsd_variant
+    }
+
+    setos_openbsd() {
+        # OpenBSD 使用 install 镜像，配合 autoinstall 自动安装
+        if is_in_china; then
+            mirror=https://mirror.nju.edu.cn/OpenBSD
+        else
+            mirror=https://cdn.openbsd.org/pub/OpenBSD
+        fi
+
+        case "$basearch" in
+        x86_64) arch_openbsd=amd64 ;;
+        aarch64) arch_openbsd=arm64 ;;
+        esac
+
+        # OpenBSD 镜像路径格式: 7.6/amd64/install76.img
+        img=$mirror/$releasever/$arch_openbsd/install${releasever//./}.img
+        test_url $img 'raw'
+        eval ${step}_img=$img
+    }
+
     eval ${step}_distro=$distro
     eval ${step}_releasever=$releasever
 
@@ -1925,6 +1986,8 @@ verify_os_name() {
         'alpine      3.20|3.21|3.22|3.23' \
         'openeuler   20.03|22.03|24.03|25.09' \
         'ubuntu      16.04|18.04|20.04|22.04|24.04|25.10' \
+        'freebsd     13.5|14.3|14.4|15.0' \
+        'openbsd     7.4|7.5|7.6|7.7' \
         'redhat' \
         'kali' \
         'arch' \
@@ -2195,8 +2258,9 @@ check_ram() {
         netboot.xyz) echo 0 ;;
         alpine | debian | kali | dd) echo 256 ;;
         arch | gentoo | aosc | nixos | windows) echo 512 ;;
-        redhat | centos | almalinux | rocky | fedora | oracle | ubuntu | anolis | opencloudos | openeuler) echo 1024 ;;
+        redhat | centos | almalinux | rocky | fedora | oracle | ubuntu | anolis | opencloudos | openeuler | freebsd) echo 1024 ;;
         opensuse | fnos) echo -1 ;; # 没有安装模式
+        openbsd) echo 1024 ;;
         esac
     )
 
@@ -2210,8 +2274,8 @@ check_ram() {
 
     has_cloud_image=$(
         case "$distro" in
-        redhat | centos | almalinux | rocky | oracle | fedora | debian | ubuntu | opensuse | anolis | openeuler) echo true ;;
-        netboot.xyz | alpine | dd | arch | gentoo | nixos | kali | windows) echo false ;;
+        redhat | centos | almalinux | rocky | oracle | fedora | debian | ubuntu | opensuse | anolis | openeuler | freebsd) echo true ;;
+        netboot.xyz | alpine | dd | arch | gentoo | nixos | kali | windows | openbsd) echo false ;;
         esac
     )
 
@@ -4290,7 +4354,8 @@ for o in ci installer debug minimal allow-ping force-cn help \
     frpc-conf: frpc-config: \
     target-disk: \
     force-boot-mode: \
-    force-old-windows-setup:; do
+    force-old-windows-setup: \
+    variant:; do
     [ -n "$long_opts" ] && long_opts+=,
     long_opts+=$o
 done
@@ -4502,6 +4567,14 @@ EOF
         web_port=$2
         shift 2
         ;;
+    --variant)
+        [ -n "$2" ] || error_and_exit "Need value for $1"
+        case "$2" in
+        ufs | zfs) bsd_variant=$2 ;;
+        *) error_and_exit "Invalid $1 value: $2 (valid: ufs, zfs)" ;;
+        esac
+        shift 2
+        ;;
     --add-driver)
         [ -n "$2" ] || error_and_exit "Need value for $1"
 
@@ -4600,7 +4673,7 @@ fi
 # 强制忽略/强制添加 --ci 参数
 # debian 不强制忽略 ci 留作测试
 case "$distro" in
-dd | windows | netboot.xyz | kali | alpine | arch | gentoo | aosc | nixos | fnos)
+dd | windows | netboot.xyz | kali | alpine | arch | gentoo | aosc | nixos | fnos | openbsd)
     if is_use_cloud_image; then
         echo "ignored --ci"
         unset cloud_image

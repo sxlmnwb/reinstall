@@ -1713,7 +1713,7 @@ install_nixos() {
             sh=$sh_mirror/nix-$nix_ver/install
         else
             # 最新版 nix 在 nixos-install 时可能会出问题
-            # https://github.com/bin456789/reinstall/issues/451
+            # https://github.com/sxlmnwb/reinstall/issues/451
             if is_in_china; then
                 sh=https://mirror.nju.edu.cn/nix/latest/install
             else
@@ -4315,6 +4315,7 @@ get_cloud_image_part_size() {
     # https://gentoo.osuosl.org/experimental/amd64/openstack/gentoo-openstack-amd64-systemd-latest.qcow2 800m
 
     # openeuler 是 .qcow2.xz，要解压后才知道 qcow2 大小
+    # freebsd 也是 .qcow2.xz
     if [ "$distro" = openeuler ]; then
         # openeuler 20.03 3g
         if [ "$releasever" = 20.03 ]; then
@@ -4322,6 +4323,9 @@ get_cloud_image_part_size() {
         else
             echo 2GiB
         fi
+    elif [ "$distro" = freebsd ]; then
+        # FreeBSD cloud image 是 .qcow2.xz，解压后约 2-3GB
+        echo 3GiB
     elif size_bytes=$(get_http_file_size "$img"); then
         # 缩小 btrfs 需要写 qcow2 ，实测写入后只多了 1M，因此不用特殊处理
         echo "$(get_part_size_mb_for_file_size_b $size_bytes)MiB"
@@ -4627,6 +4631,359 @@ install_fnos() {
 
     # frpc
     add_frpc_systemd_service_if_need $os_dir
+}
+
+install_freebsd() {
+    info "Install FreeBSD"
+    os_dir=/os
+    bsd_variant=${bsd_variant:-ufs}
+
+    if ! is_use_cloud_image; then
+        # Memstick 路径: 解压并 dd 到硬盘
+        # 云镜像路径由 trans() 中的 dd_qcow + resize 处理
+        download "$img" /freebsd.img.xz
+        info "Write FreeBSD image to disk"
+        apk add xz
+        xz -dc /freebsd.img.xz | dd of=/dev/$xda bs=4M status=progress
+        rm -f /freebsd.img.xz
+        sync
+        update_part
+    fi
+
+    mkdir -p $os_dir
+
+    # 查找分区
+    if [ "$bsd_variant" = zfs ]; then
+        # ZFS 变体: 加载 zfs 模块，查找 zpool
+        modprobe zfs 2>/dev/null || true
+        zpool import -f -R $os_dir zroot 2>/dev/null || true
+        if mountpoint -q $os_dir 2>/dev/null; then
+            if is_use_cloud_image; then
+                modify_freebsd $os_dir
+            else
+                create_freebsd_installerconfig $os_dir
+            fi
+            umount -R $os_dir
+        else
+            if is_use_cloud_image; then
+                warn "Cannot mount FreeBSD ZFS pool, using cloud-init fallback"
+                setup_freebsd_cloudinit
+            else
+                warn "Cannot mount FreeBSD ZFS pool to inject installerconfig"
+                warn "System will boot into FreeBSD installer - manual installation required"
+            fi
+        fi
+    else
+        # UFS 变体
+        ufs_part=$(lsblk -rno NAME,FSTYPE /dev/$xda | grep -i ufs | head -1 | awk '{print $1}')
+        if [ -z "$ufs_part" ]; then
+            # 回退: 按 GPT 分区类型查找
+            ufs_part=$(lsblk -rno NAME,PARTTYPE /dev/$xda | grep -i '516e7cb6-6ecf-11d6-8ff8-00022d09712b' | head -1 | awk '{print $1}')
+        fi
+        if [ -z "$ufs_part" ]; then
+            # 回退: 取最后一个分区
+            ufs_part=$(lsblk -rno NAME /dev/$xda | tail -1 | awk '{print $1}')
+        fi
+
+        # 加载 UFS 模块并尝试挂载
+        modprobe ufs 2>/dev/null || true
+        if mount -t ufs -o ufstype=ufs2,rw /dev/$ufs_part $os_dir 2>/dev/null; then
+            if is_use_cloud_image; then
+                modify_freebsd $os_dir
+            else
+                # Memstick: 注入 installerconfig 供 bsdinstall 自动安装
+                create_freebsd_installerconfig $os_dir
+            fi
+            umount $os_dir
+        else
+            if is_use_cloud_image; then
+                warn "Cannot mount FreeBSD UFS2 partition, using cloud-init fallback"
+                setup_freebsd_cloudinit
+            else
+                warn "Cannot mount FreeBSD partition to inject installerconfig"
+                warn "System will boot into FreeBSD installer - manual installation required"
+            fi
+        fi
+    fi
+}
+
+modify_freebsd() {
+    os_dir=$1
+
+    # 密码
+    if is_need_set_ssh_keys; then
+        (
+            umask 077
+            mkdir -p $os_dir/root/.ssh
+            cat /configs/ssh_keys >$os_dir/root/.ssh/authorized_keys
+        )
+        # 锁定密码登录
+        sed -i 's/^root:[^:]*:/root:*LOCKED*:/' $os_dir/etc/master.passwd
+    else
+        # FreeBSD 支持 SHA512 密码 ($6$ 格式)
+        password_hash=$(get_password_linux_sha512)
+        sed -i "s/^root:[^:]*:/root:${password_hash}:/" $os_dir/etc/master.passwd
+    fi
+
+    # 网络 - rc.conf
+    # 云镜像默认使用 DHCP，仅静态 IP 时需要额外配置
+    for ethx in $(get_eths); do
+        if is_staticv4; then
+            get_netconf_to ipv4_addr
+            get_netconf_to ipv4_gateway
+            cat >>$os_dir/etc/rc.conf <<EOF
+ifconfig_${ethx}="inet $ipv4_addr"
+defaultrouter="$ipv4_gateway"
+EOF
+        fi
+    done
+
+    # 启用 SSH
+    grep -q 'sshd_enable="YES"' $os_dir/etc/rc.conf ||
+        echo 'sshd_enable="YES"' >>$os_dir/etc/rc.conf
+
+    # 允许 root SSH 登录
+    sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' $os_dir/etc/ssh/sshd_config
+
+    # 时区
+    if [ -f /etc/localtime ]; then
+        cp /etc/localtime $os_dir/etc/localtime
+    fi
+}
+
+create_freebsd_installerconfig() {
+    os_dir=$1
+    conf=$os_dir/etc/installerconfig
+
+    # 前言 - 安装器变量
+    cat >$conf <<EOF
+DISTRIBUTIONS="kernel.txz base.txz"
+PARTITIONS=DEFAULT
+nonInteractive="YES"
+EOF
+
+    # BSDINSTALL_DISTSITE 用于下载发行包
+    # arch_freebsd 由 reinstall.sh 通过 finalos_arch_freebsd 传入
+    arch_freebsd=${finalos_arch_freebsd:-$(case $(uname -m) in x86_64) echo amd64 ;; aarch64) echo arm64 ;; esac)}
+    if is_in_china; then
+        echo "BSDINSTALL_DISTSITE=https://mirror.nju.edu.cn/freebsd/releases/$releasever-RELEASE/$arch_freebsd" >>$conf
+    else
+        echo "BSDINSTALL_DISTSITE=https://download.freebsd.org/releases/$releasever-RELEASE/$arch_freebsd" >>$conf
+    fi
+
+    # 安装后脚本 (在 chroot 环境中运行)
+    cat >>$conf <<'SETUPEOF'
+#!/bin/sh
+SETUPEOF
+
+    # 密码
+    if is_need_set_ssh_keys; then
+        cat >>$conf <<'EOF'
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+EOF
+        while IFS= read -r key; do
+            echo "echo '$key' >> /root/.ssh/authorized_keys" >>$conf
+        done </configs/ssh_keys
+        cat >>$conf <<'EOF'
+chmod 600 /root/.ssh/authorized_keys
+EOF
+    else
+        password_hash=$(get_password_linux_sha512)
+        cat >>$conf <<EOF
+echo 'root:${password_hash}' | pw usermod root -H 0
+EOF
+    fi
+
+    # 网络和 SSH
+    cat >>$conf <<'EOF'
+sysrc sshd_enable=YES
+sysrc ifconfig_DEFAULT=DHCP
+sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+EOF
+
+    for ethx in $(get_eths); do
+        if is_staticv4; then
+            get_netconf_to ipv4_addr
+            get_netconf_to ipv4_gateway
+            cat >>$conf <<EOF
+sysrc ifconfig_${ethx}="inet $ipv4_addr"
+sysrc defaultrouter="$ipv4_gateway"
+EOF
+        fi
+    done
+}
+
+setup_freebsd_cloudinit() {
+    # 创建 FAT32 分区 (标签 cidata) 供 cloud-init NoCloud 使用
+    # FreeBSD 云镜像已预装 cloud-init
+
+    apk add parted dosfstools
+
+    # 缩小最后一个分区以腾出空间给 cidata
+    disk_size=$(get_disk_size /dev/$xda)
+    last_part_end=$(parted -msf /dev/$xda 'unit b print' | tail -1 | cut -d: -f3 | sed 's/B//')
+    free_space=$((disk_size - last_part_end))
+
+    if [ $free_space -lt $((10 * 1024 * 1024)) ]; then
+        last_part_num=$(parted -msf /dev/$xda 'unit b print' | tail -1 | cut -d: -f1)
+        printf "yes" | parted /dev/$xda resizepart $last_part_num "$((disk_size - 10 * 1024 * 1024))B" ---pretend-input-tty
+        update_part
+    fi
+
+    # 创建 cidata 分区
+    parted /dev/$xda -s -- mkpart cidata fat32 100% 100%
+    update_part
+
+    # 找到新分区
+    cidata_part=$(lsblk -rno NAME /dev/$xda | tail -1 | awk '{print $1}')
+
+    # 格式化并挂载
+    mkfs.fat -n cidata /dev/$cidata_part
+    mkdir -p /cidata
+    mount /dev/$cidata_part /cidata
+
+    # meta-data
+    echo 'instance-id: freebsd' >/cidata/meta-data
+
+    # user-data
+    cat >/cidata/user-data <<EOF
+#cloud-config
+EOF
+
+    if is_need_set_ssh_keys; then
+        echo 'ssh_authorized_keys:' >>/cidata/user-data
+        while IFS= read -r key; do
+            echo "  - $key" >>/cidata/user-data
+        done </configs/ssh_keys
+    else
+        # cloud-init 支持 hashed_passwd (SHA512)
+        password_hash=$(get_password_linux_sha512)
+        if [ -n "$password_hash" ]; then
+            cat >>/cidata/user-data <<EOF
+chpasswd:
+  list: |
+    root:$password_hash
+  expire: False
+hash_passwd: True
+EOF
+        fi
+    fi
+
+    # 网络配置
+    for ethx in $(get_eths); do
+        if is_staticv4; then
+            get_netconf_to ipv4_addr
+            get_netconf_to ipv4_gateway
+            cat >>/cidata/user-data <<EOF
+network:
+  version: 1
+  config:
+    - type: physical
+      name: $ethx
+      subnets:
+        - type: static
+          address: $ipv4_addr
+          gateway: $ipv4_gateway
+EOF
+        fi
+    done
+
+    umount /cidata
+}
+
+install_openbsd() {
+    info "Install OpenBSD"
+    os_dir=/os
+
+    # 下载并 dd install 镜像
+    download "$img" /openbsd.img
+    dd if=/openbsd.img of=/dev/$xda bs=4M status=progress
+    rm -f /openbsd.img
+    sync
+    update_part
+
+    # 尝试挂载 FFS2 并注入 auto_install.conf
+    modprobe ufs 2>/dev/null || true
+    mkdir -p $os_dir
+
+    # 查找 OpenBSD 分区 (GPT 类型或最后一个分区)
+    obsd_part=$(lsblk -rno NAME,PARTTYPE /dev/$xda | grep -i '824cc7a0-36a8-11e3-890a-952519ad386f' | head -1 | awk '{print $1}')
+    if [ -z "$obsd_part" ]; then
+        obsd_part=$(lsblk -rno NAME /dev/$xda | tail -1 | awk '{print $1}')
+    fi
+
+    if mount -t ufs -o ufstype=ufs2,rw /dev/$obsd_part $os_dir 2>/dev/null; then
+        create_openbsd_autoinstall $os_dir
+        umount $os_dir
+        info "OpenBSD autoinstall configured"
+    else
+        warn "Cannot mount OpenBSD partition to inject autoinstall config"
+        warn "System will boot into OpenBSD installer - manual installation required"
+    fi
+}
+
+create_openbsd_autoinstall() {
+    os_dir=$1
+    conf=$os_dir/auto_install.conf
+
+    # 主机名
+    echo "System hostname = openbsd" >$conf
+
+    # 密码
+    if is_need_set_ssh_keys; then
+        # 13 个星号 = 禁用密码登录
+        echo "Password for root = *************" >>$conf
+        while IFS= read -r key; do
+            echo "Public ssh key for root account = $key" >>$conf
+        done </configs/ssh_keys
+    else
+        password_plain=$(get_password_plaintext)
+        if [ -n "$password_plain" ]; then
+            echo "Password for root = $password_plain" >>$conf
+        fi
+    fi
+
+    # 网络
+    for ethx in $(get_eths); do
+        if is_dhcpv4; then
+            echo "IPv4 address for $ethx = dhcp" >>$conf
+        elif is_staticv4; then
+            get_netconf_to ipv4_addr
+            get_netconf_to ipv4_gateway
+            echo "IPv4 address for $ethx = $ipv4_addr" >>$conf
+            echo "Default IPv4 route = $ipv4_gateway" >>$conf
+        fi
+    done
+
+    # DNS
+    if list=$(get_current_dns 4); then
+        for dns in $list; do
+            echo "DNS domain name = " >>$conf
+            echo "DNS nameserver = $dns" >>$conf
+        done
+    fi
+
+    # 时区
+    echo "What timezone are you in = UTC" >>$conf
+
+    # 磁盘 - 使用整块磁盘 GPT 分区
+    # OpenBSD 使用 sd0/wd0 命名，安装器应自动检测唯一磁盘
+    echo "Which disk is the root disk = sd0" >>$conf
+    echo "Use (W)hole disk MBR, whole disk (G)PT or (E)dit = G" >>$conf
+    echo "URL to autopartitioning template for disklabel =" >>$conf
+
+    # 软件包
+    echo "Location of sets = http" >>$conf
+    if is_in_china; then
+        echo "HTTP Server = mirror.nju.edu.cn" >>$conf
+    else
+        echo "HTTP Server = cdn.openbsd.org" >>$conf
+    fi
+    echo "Set name(s) = -game* -x*" >>$conf
+
+    # 安装完成后重启
+    echo "Exit to (S)hell, (H)alt or (R)eboot = R" >>$conf
 }
 
 install_qcow_by_copy() {
@@ -7464,7 +7821,7 @@ trans() {
 
     # 先检查 modloop 是否正常
     # 防止格式化硬盘后，缺少 ext4 模块导致 mount 失败
-    # https://github.com/bin456789/reinstall/issues/136
+    # https://github.com/sxlmnwb/reinstall/issues/136
     ensure_service_started modloop
 
     cat /proc/cmdline
@@ -7508,10 +7865,13 @@ trans() {
                 install_qcow_by_copy
                 ;;
             *)
-                # debian fedora opensuse arch gentoo any
+                # debian fedora opensuse arch gentoo any freebsd
                 dd_qcow
                 resize_after_install_cloud_image
-                modify_os_on_disk linux
+                case "$distro" in
+                freebsd) install_freebsd ;;
+                *) modify_os_on_disk linux ;;
+                esac
                 ;;
             esac
             ;;
@@ -7557,6 +7917,12 @@ trans() {
         fnos)
             create_part
             install_fnos
+            ;;
+        freebsd)
+            install_freebsd
+            ;;
+        openbsd)
+            install_openbsd
             ;;
         *)
             create_part
@@ -7625,7 +7991,7 @@ mount / -o remount,size=100%
 
 # 同步时间
 # 1. 可以防止访问 https 出错
-# 2. 可以防止 https://github.com/bin456789/reinstall/issues/223
+# 2. 可以防止 https://github.com/sxlmnwb/reinstall/issues/223
 #    E: Release file for http://security.ubuntu.com/ubuntu/dists/noble-security/InRelease is not valid yet (invalid for another 5h 37min 18s).
 #    Updates for this repository will not be applied.
 # 3. 不能直接读取 rtc，因为默认情况 windows rtc 是本地时间，linux rtc 是 utc 时间
